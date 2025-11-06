@@ -4,3 +4,4 @@ One file containns the Jupyter notebook with the code used for satellite image p
 One file contains the html file of the image processing programming code .
 One pdf file contains the manuscript authored out of the research project and produced for the MDPI Remote Sensing journal. 
 The second research project is my masters dissertation entitled "Quantifying oil palm-induced deforestation and land cover change on Bugala island in Uganda using machine learning and satellite remote sensing". 
+The third project investigates the impact of sugar cane cultivation on land cover changes of Mabira Forest using satellite remote sensing. Its a study of defforestation.
