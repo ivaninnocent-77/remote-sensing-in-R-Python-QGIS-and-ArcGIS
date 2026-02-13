@@ -1,0 +1,361 @@
+---
+title: "Categorical Change Detection and Machine Learning using R"
+author: "Ivan Innocent Sekibenga"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+Categorical change detection is a remote sensing technique used to identify and classify changes in land cover between two or more dates of satellite imagery. By combining change detection with machine learning in R, we can automate the classification of change types (e.g., urbanization, agricultural conversion) with greater accuracy.
+
+This tutorial uses two Landsat images of California's Central Valley captured a decade apart:
+
+-   **Time 1 (2001)**: Landsat 7 ETM+ (`centralvalley-2001LE7.tif`)
+-   **Time 2 (2011)**: Landsat 5 TM (`centralvalley-2011LT5.tif`)
+
+Both images have 6 spectral bands: B1 (Blue), B2 (Green), B3 (Red), B4 (NIR), B5 (SWIR1), and B7 (SWIR2).
+
+Training polygons from `lcsamples.rds` provide labeled land cover classes: **cropland**, **fallow**, **built**, **open**, and **water**.
+
+# Load Required Packages
+
+```{r load-packages}
+library(terra)       # Modern raster data handling
+library(sf)          # Vector/spatial data
+library(tidyverse)   # Data wrangling and visualization
+library(tidymodels)  # Machine learning workflows
+library(kableExtra)  # Table formatting
+```
+
+# Load and Explore Raster Data
+
+## Load Multi-Temporal Imagery
+
+```{r load-rasters}
+# Load raster images for two time periods
+raster_t1 <- rast("data/rs/centralvalley-2001LE7.tif")
+raster_t2 <- rast("data/rs/centralvalley-2011LT5.tif")
+
+# Inspect properties
+raster_t1
+raster_t2
+```
+
+```{r compare-geom}
+# Check that both rasters have compatible geometry
+compareGeom(raster_t1, raster_t2)
+```
+
+Both rasters share the same extent, resolution, and CRS (WGS 84), which is essential for pixel-by-pixel change detection.
+
+## Visualize the Imagery
+
+```{r true-color-t1, fig.cap="True color composite - 2001"}
+# True color composite (R=B3, G=B2, B=B1) for Time 1
+plotRGB(raster_t1, r = 3, g = 2, b = 1, stretch = "lin",
+        main = "Central Valley 2001 (Landsat 7 ETM+)")
+```
+
+```{r true-color-t2, fig.cap="True color composite - 2011"}
+# True color composite for Time 2
+plotRGB(raster_t2, r = 3, g = 2, b = 1, stretch = "lin",
+        main = "Central Valley 2011 (Landsat 5 TM)")
+```
+
+```{r false-color, fig.cap="False color composites highlighting vegetation"}
+# False color composites (NIR, Red, Green) to highlight vegetation
+par(mfrow = c(1, 2))
+plotRGB(raster_t1, r = 4, g = 3, b = 2, stretch = "lin",
+        main = "2001 False Color")
+plotRGB(raster_t2, r = 4, g = 3, b = 2, stretch = "lin",
+        main = "2011 False Color")
+par(mfrow = c(1, 1))
+```
+
+# Load and Prepare Training Data
+
+## Load Training Samples
+
+The training data consists of 49 labeled polygons covering 5 land cover classes.
+
+```{r load-training}
+# Load training polygons (SpatVector)
+training_polys <- readRDS("data/rs/lcsamples.rds")
+
+# Preview the class distribution
+training_df <- as.data.frame(training_polys)
+training_df |> count(class) |>
+  kable(caption = "Training Sample Distribution by Class") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Extract Spectral Values
+
+We extract the pixel values from each raster at the training polygon locations. Since the training polygons are in UTM Zone 10 and the rasters are in WGS 84, we need to reproject the polygons first.
+
+```{r extract-values-t1}
+# Reproject training polygons to match raster CRS
+training_reproj <- project(training_polys, crs(raster_t1))
+
+# Extract spectral values for Time 1
+extract_t1 <- terra::extract(raster_t1, training_reproj, df = TRUE)
+extract_t1 <- extract_t1 |>
+  left_join(
+    tibble(ID = seq_len(nrow(training_polys)),
+           class = training_polys$class),
+    by = "ID"
+  ) |>
+  mutate(class = as.factor(class)) |>
+  select(class, B1:B7) |>
+  drop_na()
+
+head(extract_t1)
+```
+
+```{r extract-values-t2}
+# Extract spectral values for Time 2
+extract_t2 <- terra::extract(raster_t2, training_reproj, df = TRUE)
+extract_t2 <- extract_t2 |>
+  left_join(
+    tibble(ID = seq_len(nrow(training_polys)),
+           class = training_polys$class),
+    by = "ID"
+  ) |>
+  mutate(class = as.factor(class)) |>
+  select(class, B1:B7) |>
+  drop_na()
+
+head(extract_t2)
+```
+
+```{r sample-counts}
+cat("Time 1 extracted pixels:", nrow(extract_t1), "\n")
+cat("Time 2 extracted pixels:", nrow(extract_t2), "\n")
+```
+
+## Explore Spectral Signatures
+
+```{r spectral-signatures}
+# Compute mean spectral values per class for Time 1
+spectral_means <- extract_t1 |>
+  group_by(class) |>
+  summarise(across(B1:B7, mean)) |>
+  pivot_longer(cols = B1:B7, names_to = "band", values_to = "reflectance")
+
+ggplot(spectral_means, aes(x = band, y = reflectance, color = class, group = class)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(title = "Mean Spectral Signatures by Land Cover Class (2001)",
+       x = "Band", y = "Reflectance", color = "Class")
+```
+
+# Land Cover Classification with Random Forest
+
+## Split Training Data
+
+```{r split-data}
+set.seed(6142)
+
+# Split Time 1 training data
+split_t1 <- initial_split(extract_t1, prop = 0.7, strata = class)
+train_t1 <- training(split_t1)
+test_t1 <- testing(split_t1)
+
+cat("Time 1 - Training pixels:", nrow(train_t1), "\n")
+cat("Time 1 - Testing pixels:", nrow(test_t1), "\n")
+train_t1 |> count(class)
+```
+
+## Define and Fit Random Forest Model
+
+Random Forest is widely used in remote sensing classification due to its robustness with high-dimensional spectral data and resistance to overfitting.
+
+```{r rf-model}
+# Define Random Forest model
+rf_model <- rand_forest(trees = 500) |>
+  set_engine("randomForest") |>
+  set_mode("classification")
+
+# Define preprocessing recipe
+rf_recipe <- recipe(class ~ ., data = train_t1) |>
+  step_normalize(all_predictors())
+
+# Create and fit the workflow
+rf_workflow <- workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model) |>
+  fit(train_t1)
+
+rf_workflow
+```
+
+## Accuracy Assessment
+
+```{r accuracy}
+# Predict on the held-out test set
+test_predictions <- augment(rf_workflow, test_t1)
+
+# Confusion matrix
+conf_mat(test_predictions, truth = class, estimate = .pred_class)
+```
+
+```{r metrics}
+# Overall accuracy and Kappa
+test_predictions |>
+  metrics(truth = class, estimate = .pred_class) |>
+  kable(caption = "Classification Accuracy Metrics") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Variable Importance
+
+```{r var-importance}
+library(vip)
+
+rf_workflow |>
+  extract_fit_parsnip() |>
+  vip(num_features = 6) +
+  labs(title = "Band Importance for Land Cover Classification")
+```
+
+# Classify Raster Images
+
+## Classify Time 1 (2001)
+
+```{r classify-t1}
+# Predict land cover for the entire 2001 image
+classified_t1 <- terra::predict(raster_t1, rf_workflow, na.rm = TRUE)
+
+# Define class colors
+class_colors <- c("built" = "red", "cropland" = "green",
+                   "fallow" = "yellow", "open" = "grey", "water" = "blue")
+
+plot(classified_t1, main = "Land Cover Classification - 2001",
+     col = class_colors, type = "classes")
+```
+
+## Train and Classify Time 2 (2011)
+
+We train a separate model for Time 2 because the spectral characteristics may differ between sensors and dates.
+
+```{r classify-t2}
+set.seed(8371)
+
+# Split Time 2 training data
+split_t2 <- initial_split(extract_t2, prop = 0.7, strata = class)
+train_t2 <- training(split_t2)
+test_t2 <- testing(split_t2)
+
+# Fit Random Forest for Time 2
+rf_workflow_t2 <- workflow() |>
+  add_recipe(recipe(class ~ ., data = train_t2) |>
+               step_normalize(all_predictors())) |>
+  add_model(rf_model) |>
+  fit(train_t2)
+
+# Accuracy for Time 2
+test_pred_t2 <- augment(rf_workflow_t2, test_t2)
+conf_mat(test_pred_t2, truth = class, estimate = .pred_class)
+```
+
+```{r classify-t2-raster}
+# Predict land cover for the entire 2011 image
+classified_t2 <- terra::predict(raster_t2, rf_workflow_t2, na.rm = TRUE)
+
+plot(classified_t2, main = "Land Cover Classification - 2011",
+     col = class_colors, type = "classes")
+```
+
+# Post-Classification Change Detection
+
+Post-classification change detection compares two independently classified maps to identify pixels where the land cover class has changed between the two dates.
+
+## Generate Change Map
+
+```{r change-map}
+# Identify changed pixels: TRUE where class differs between dates
+change_binary <- classified_t1 != classified_t2
+
+plot(change_binary, main = "Change Detection (2001 vs 2011)",
+     col = c("white", "red"), legend = FALSE)
+legend("topright", legend = c("No Change", "Change"),
+       fill = c("white", "red"))
+```
+
+## Build Transition Matrix
+
+The transition matrix (cross-tabulation) shows how many pixels transitioned from each class in 2001 to each class in 2011.
+
+```{r transition-matrix}
+# Extract classified values
+vals_t1 <- values(classified_t1) |> as.vector()
+vals_t2 <- values(classified_t2) |> as.vector()
+
+# Remove NA pairs
+valid <- !is.na(vals_t1) & !is.na(vals_t2)
+
+transition_table <- table(
+  "From (2001)" = vals_t1[valid],
+  "To (2011)" = vals_t2[valid]
+)
+
+transition_table |>
+  as.data.frame.matrix() |>
+  kable(caption = "Land Cover Transition Matrix (pixel counts): 2001 to 2011") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Identify Specific Transitions
+
+```{r specific-changes}
+# Example: Identify pixels that changed from cropland to built (urbanization)
+cropland_to_built <- (classified_t1 == "cropland") & (classified_t2 == "built")
+
+plot(cropland_to_built, main = "Cropland to Built-up Conversion (2001-2011)",
+     col = c("white", "red"), legend = FALSE)
+legend("topright", legend = c("No Change", "Cropland to Built"),
+       fill = c("white", "red"))
+```
+
+## Quantify Changes
+
+```{r change-summary}
+# Compute area of each transition (in number of pixels)
+transition_df <- as.data.frame(transition_table)
+names(transition_df) <- c("From_2001", "To_2011", "Pixels")
+
+# Show only transitions where change occurred
+transition_df |>
+  filter(From_2001 != To_2011, Pixels > 0) |>
+  arrange(desc(Pixels)) |>
+  kable(caption = "Land Cover Transitions (Changed Pixels Only)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+# Summary
+
+This tutorial demonstrated a complete categorical change detection workflow for the Central Valley, California using Landsat imagery from 2001 and 2011:
+
+1.  **Data loading** — Multi-temporal Landsat imagery and labeled training polygons
+2.  **Spectral exploration** — Visualized band signatures across 5 land cover classes
+3.  **Classification** — Random Forest via tidymodels for both time periods
+4.  **Accuracy assessment** — Confusion matrices and overall accuracy metrics
+5.  **Change detection** — Post-classification comparison to map land cover change
+6.  **Transition analysis** — Quantified pixel-level from-to transitions
+
+Key considerations:
+
+-   **Sensor differences**: Landsat 7 ETM+ (2001) and Landsat 5 TM (2011) have similar but not identical spectral characteristics. Training separate models per date accounts for this.
+-   **Training sample quality**: With only 49 polygons across 5 classes, classification accuracy is dependent on sample representativeness. The water class (3 polygons) is particularly underrepresented.
+-   **Error propagation**: Post-classification change detection compounds errors from both independent classifications, so high per-class accuracy is important for reliable change maps.
